@@ -16,107 +16,26 @@ USE_REGULAR_BATCH_VERSION = True
 if USE_REGULAR_BATCH_VERSION:
     batch_wrapper = lambda x: x
 else:
-    batch_wrapper = lambda x: jaxm.vmap(x)
+    batch_wrapper = lambda x: jaxm.vmap(x, axis_name="batch")
 
 
 class ReLU(eqx.Module):
     def __call__(self, x, *args, **kw):
         return jaxm.maximum(x, 0)
 
-STATE_INIT_COUNTER = 0
-
 ####################################################################################################
 
 
-if False and USE_REGULAR_BATCH_VERSION:
+class BatchNorm2d(eqx.Module):
+    bn: BatchNorm
 
-    class BatchNorm2d(eqx.Module):
-        bn: BatchNorm
+    def __init__(self, channels, affine=True):
+        self.bn = BatchNorm(channels, channelwise_affine=affine, axis_name="batch")
 
-        def __init__(self, channels, affine=True):
-            self.bn = BatchNorm(channels, channelwise_affine=affine, axis_name="batch")
-
-        def __call__(self, x, *args, **kw):
-            return self.bn(x)
-
-else:
-
-    class BatchNorm2d(eqx.Module):
-        momentum: float = 0.1
-        gamma: Array
-        beta: Array
-        affine: bool
-        in_channels: int
-        hash: int
-        eps: float
-
-        def __init__(self, in_channels, affine=False, momentum=0.1, eps=1e-5):
-            self.in_channels = in_channels
-            self.momentum = momentum
-            self.affine = affine
-            self.gamma, self.beta = jaxm.ones(1), jaxm.zeros(1)
-            self.hash = hash((id(self), in_channels, momentum, affine, eps))
-            self.eps = eps
-
-        def init_state(self):
-            running_mean = jaxm.zeros(self.in_channels)
-            running_var = jaxm.ones(self.in_channels)
-            global STATE_INIT_COUNTER
-            STATE_INIT_COUNTER += 1
-            return {
-                f"{self.hash}_running_mean": running_mean,
-                f"{self.hash}_running_var": running_var,
-            }
-
-        def __call__(self, x, state=None):
-            if state is None:
-                state = self.init_state()
-            if f"{self.hash}_running_mean" not in state or f"{self.hash}_running_var" not in state:
-                state = dict(state, **self.init_state())
-            running_mean = state[f"{self.hash}_running_mean"]
-            running_var = state[f"{self.hash}_running_var"]
-
-            axis = tuple(-i for i in range(1, x.ndim + 1) if i != -3)
-            mean = jaxm.mean(x, axis=axis)
-            var = jaxm.var(x, axis=axis)
-            running_mean = (1 - self.momentum) * running_mean + self.momentum * mean
-            running_var = (1 - self.momentum) * running_var + self.momentum * var
-
-            mean, var = running_mean[:, None, None], running_var[:, None, None]
-            if self.affine:
-                x = (x - mean) / jaxm.sqrt(var + self.eps) * self.gamma + self.beta
-            else:
-                x = (x - mean) / jaxm.sqrt(var + self.eps)
-            return x, state
-
+    def __call__(self, x, *args, **kw):
+        return self.bn(x)
 
 ####################################################################################################
-
-
-class Sequential(eqx.Module):
-    mod_list: List[eqx.Module]
-
-    def __init__(self, mod_list: List[eqx.Module]):
-        self.mod_list = mod_list
-
-    def init_state(self):
-        state = dict()
-        for mod in self.mod_list:
-            if hasattr(mod, "init_state"):
-                state = dict(state, **mod.init_state())
-        return state
-
-    def __call__(self, x, state=None):
-        total_state = dict() if state is None else copy(state)
-        for mod in self.mod_list:
-            out = mod(x, state=total_state)
-            if isinstance(out, tuple):
-                x, state = out
-                total_state = dict(total_state, **state)
-            else:
-                x = out
-        return x, total_state
-
 
 class Conv2d(eqx.Module):
     op: nn.Conv2d
@@ -124,7 +43,7 @@ class Conv2d(eqx.Module):
     def __init__(self, *args, **kw):
         self.op = nn.Conv2d(*args, **kw)
 
-    def __call__(self, x, state=None):
+    def __call__(self, x, *args, **kw):
         return batch_wrapper(self.op)(x)
 
 
@@ -134,7 +53,7 @@ class AdaptiveAvgPool2d(eqx.Module):
     def __init__(self, *args, **kw):
         self.op = nn.AdaptiveAvgPool2d(*args, **kw)
 
-    def __call__(self, x, state=None):
+    def __call__(self, x, *args, **kw):
         return batch_wrapper(self.op)(x)
 
 
@@ -144,7 +63,7 @@ class Linear(eqx.Module):
     def __init__(self, *args, **kw):
         self.op = nn.Linear(*args, **kw)
 
-    def __call__(self, x, state=None):
+    def __call__(self, x, *args, **kw):
         return batch_wrapper(self.op)(x)
 
 
@@ -154,7 +73,7 @@ class MaxPool2d(eqx.Module):
     def __init__(self, *args, **kw):
         self.op = nn.MaxPool2d(*args, **kw)
 
-    def __call__(self, x, state=None):
+    def __call__(self, x, *args, **kw):
         return batch_wrapper(self.op)(x)
 
 
@@ -164,7 +83,7 @@ class AvgPool2d(eqx.Module):
     def __init__(self, *args, **kw):
         self.op = nn.AvgPool2d(*args, **kw)
 
-    def __call__(self, x, state=None):
+    def __call__(self, x, *args, **kw):
         return batch_wrapper(self.op)(x)
 
 
@@ -172,10 +91,10 @@ class AvgPool2d(eqx.Module):
 
 
 class ReLUConvBN(eqx.Module):
-    op: Sequential
+    op: nn.Sequential
 
     def __init__(self, C_in, C_out, kernel_size, stride, padding, affine=True):
-        self.op = Sequential(
+        self.op = nn.Sequential(
             [
                 ReLU(),
                 Conv2d(
@@ -196,10 +115,10 @@ class ReLUConvBN(eqx.Module):
 
 
 class DilConv(eqx.Module):
-    op: Sequential
+    op: nn.Sequential
 
     def __init__(self, C_in, C_out, kernel_size, stride, padding, dilation, affine=True):
-        self.op = Sequential(
+        self.op = nn.Sequential(
             [
                 ReLU(),
                 Conv2d(
@@ -223,10 +142,10 @@ class DilConv(eqx.Module):
 
 
 class SepConv(eqx.Module):
-    op: Sequential
+    op: nn.Sequential
 
     def __init__(self, C_in, C_out, kernel_size, stride, padding, affine=True):
-        self.op = Sequential(
+        self.op = nn.Sequential(
             [
                 ReLU(),
                 Conv2d(
@@ -291,11 +210,11 @@ class FactorizedReduce(eqx.Module):
         self.conv_2 = Conv2d(C_in, C_out // 2, 1, stride=2, padding=0, use_bias=False, key=mrk())
         self.bn = BatchNorm2d(C_out, affine=affine)
 
-    def __call__(self, x, state=None):
+    def __call__(self, x, *args, **kw):
         x = self.relu(x)
         out = jaxm.cat([self.conv_1(x), self.conv_2(x[..., :, 1:, 1:])], axis=-3)
-        out, state = self.bn(out, state=state)
-        return out, state
+        out = self.bn(out)
+        return out
 
 
 OPS = {
@@ -310,7 +229,7 @@ OPS = {
     "sep_conv_7x7": lambda C, stride, affine: SepConv(C, C, 7, stride, 3, affine=affine),
     "dil_conv_3x3": lambda C, stride, affine: DilConv(C, C, 3, stride, 2, 2, affine=affine),
     "dil_conv_5x5": lambda C, stride, affine: DilConv(C, C, 5, stride, 4, 2, affine=affine),
-    "conv_7x1_1x7": lambda C, stride, affine: Sequential(
+    "conv_7x1_1x7": lambda C, stride, affine: nn.Sequential(
         [
             ReLU(),
             Conv2d(C, C, (1, 7), stride=(1, stride), padding=(0, 3), use_bias=False, key=mrk()),
