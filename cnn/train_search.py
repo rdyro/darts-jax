@@ -1,3 +1,7 @@
+# not implemented
+raise NotImplementedError
+
+
 import os
 import sys
 import time

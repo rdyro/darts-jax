@@ -1,3 +1,6 @@
+# not implemented
+raise NotImplementedError
+
 import sys
 import genotypes
 from graphviz import Digraph

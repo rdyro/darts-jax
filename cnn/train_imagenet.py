@@ -1,3 +1,6 @@
+# not implemented
+raise NotImplementedError
+
 import os
 import sys
 import numpy as np

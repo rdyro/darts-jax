@@ -1,3 +1,6 @@
+# not implemented
+raise NotImplementedError
+
 import torch
 import numpy as np
 import torch.nn as nn

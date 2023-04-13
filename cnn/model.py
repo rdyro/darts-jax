@@ -1,3 +1,6 @@
+# not implemented
+raise NotImplementedError
+
 import torch
 import torch.nn as nn
 from operations import *
