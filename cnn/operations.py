@@ -11,13 +11,7 @@ from equinox.experimental import BatchNorm
 
 from jax import Array
 
-USE_REGULAR_BATCH_VERSION = True
-
-if USE_REGULAR_BATCH_VERSION:
-    batch_wrapper = lambda x: x
-else:
-    batch_wrapper = lambda x: jaxm.vmap(x)
-
+batch_wrapper = lambda x: jaxm.vmap(x)
 
 class ReLU(eqx.Module):
     def __call__(self, x, *args, **kw):
@@ -28,66 +22,55 @@ STATE_INIT_COUNTER = 0
 ####################################################################################################
 
 
-if False and USE_REGULAR_BATCH_VERSION:
+class BatchNorm2d(eqx.Module):
+    momentum: float = 0.1
+    gamma: Array
+    beta: Array
+    affine: bool
+    in_channels: int
+    hash: int
+    eps: float
 
-    class BatchNorm2d(eqx.Module):
-        bn: BatchNorm
+    def __init__(self, in_channels, affine=False, momentum=0.1, eps=1e-5):
+        self.in_channels = in_channels
+        self.momentum = momentum
+        self.affine = affine
+        self.gamma, self.beta = jaxm.ones(1), jaxm.zeros(1)
+        self.hash = id(self)
+        self.eps = eps
 
-        def __init__(self, channels, affine=True):
-            self.bn = BatchNorm(channels, channelwise_affine=affine, axis_name="batch")
+    def init_state(self):
+        running_mean = jaxm.zeros(self.in_channels)
+        running_var = jaxm.ones(self.in_channels)
+        global STATE_INIT_COUNTER
+        STATE_INIT_COUNTER += 1
+        return {
+            f"{self.hash}_running_mean": running_mean,
+            f"{self.hash}_running_var": running_var,
+        }
 
-        def __call__(self, x, *args, **kw):
-            return self.bn(x)
+    def __call__(self, x, state=None):
+        if state is None:
+            state = self.init_state()
+        if f"{self.hash}_running_mean" not in state or f"{self.hash}_running_var" not in state:
+            state = dict(state, **self.init_state())
+        running_mean = state[f"{self.hash}_running_mean"]
+        running_var = state[f"{self.hash}_running_var"]
 
-else:
+        axis = tuple(-i for i in range(1, x.ndim + 1) if i != -3)
+        mean = jaxm.mean(x, axis=axis)
+        var = jaxm.var(x, axis=axis)
+        running_mean = (1 - self.momentum) * running_mean + self.momentum * mean
+        running_var = (1 - self.momentum) * running_var + self.momentum * var
+        state[f"{self.hash}_running_mean"] = running_mean
+        state[f"{self.hash}_running_var"] = running_var
 
-    class BatchNorm2d(eqx.Module):
-        momentum: float = 0.1
-        gamma: Array
-        beta: Array
-        affine: bool
-        in_channels: int
-        hash: int
-        eps: float
-
-        def __init__(self, in_channels, affine=False, momentum=0.1, eps=1e-5):
-            self.in_channels = in_channels
-            self.momentum = momentum
-            self.affine = affine
-            self.gamma, self.beta = jaxm.ones(1), jaxm.zeros(1)
-            self.hash = hash((id(self), in_channels, momentum, affine, eps))
-            self.eps = eps
-
-        def init_state(self):
-            running_mean = jaxm.zeros(self.in_channels)
-            running_var = jaxm.ones(self.in_channels)
-            global STATE_INIT_COUNTER
-            STATE_INIT_COUNTER += 1
-            return {
-                f"{self.hash}_running_mean": running_mean,
-                f"{self.hash}_running_var": running_var,
-            }
-
-        def __call__(self, x, state=None):
-            if state is None:
-                state = self.init_state()
-            if f"{self.hash}_running_mean" not in state or f"{self.hash}_running_var" not in state:
-                state = dict(state, **self.init_state())
-            running_mean = state[f"{self.hash}_running_mean"]
-            running_var = state[f"{self.hash}_running_var"]
-
-            axis = tuple(-i for i in range(1, x.ndim + 1) if i != -3)
-            mean = jaxm.mean(x, axis=axis)
-            var = jaxm.var(x, axis=axis)
-            running_mean = (1 - self.momentum) * running_mean + self.momentum * mean
-            running_var = (1 - self.momentum) * running_var + self.momentum * var
-
-            mean, var = running_mean[:, None, None], running_var[:, None, None]
-            if self.affine:
-                x = (x - mean) / jaxm.sqrt(var + self.eps) * self.gamma + self.beta
-            else:
-                x = (x - mean) / jaxm.sqrt(var + self.eps)
-            return x, state
+        mean, var = running_mean[:, None, None], running_var[:, None, None]
+        if self.affine:
+            x = (x - mean) / jaxm.sqrt(var + self.eps) * self.gamma + self.beta
+        else:
+            x = (x - mean) / jaxm.sqrt(var + self.eps)
+        return x, state
 
 
 ####################################################################################################
