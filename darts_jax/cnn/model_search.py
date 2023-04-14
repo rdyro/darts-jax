@@ -29,13 +29,13 @@ class MixedOp(eqx.Module):
             self._ops.append(op)
 
     def __call__(self, x, state=None, weights=None):
-        #return sum(w * op(x) for w, op in zip(weights, self._ops))
+        # return sum(w * op(x) for w, op in zip(weights, self._ops))
         assert weights is not None
         outputs = [op(x, state=state) for op in self._ops]
         xs, states = zip(
             *[(out[0], out[1]) if isinstance(out, tuple) else (out[0], dict()) for out in outputs]
         )
-        x = sum(w * x for w, x in zip(weights, xs)) 
+        x = sum(w * x for w, x in zip(weights, xs))
         state = dict()
         for state_ in states:
             state.update(state_)
@@ -82,9 +82,14 @@ class Cell(eqx.Module):
         outputs = [s0, s1]
         offset = 0
         for i in range(self._steps):
-            #ss, states = zip(*[self._ops[offset + j](h, weights=weights[offset + j], state=state) for j, h in enumerate(states)])
-            rets = [self._ops[offset + j](h, weights=weights[offset + j], state=state) for j, h in enumerate(outputs)]
-            ss, states = zip(*[(ret[0], ret[1]) if isinstance(ret, tuple) else (ret[0], dict()) for ret in rets])
+            # ss, states = zip(*[self._ops[offset + j](h, weights=weights[offset + j], state=state) for j, h in enumerate(states)])
+            rets = [
+                self._ops[offset + j](h, weights=weights[offset + j], state=state)
+                for j, h in enumerate(outputs)
+            ]
+            ss, states = zip(
+                *[(ret[0], ret[1]) if isinstance(ret, tuple) else (ret[0], dict()) for ret in rets]
+            )
             s = sum(ss)
             assert not isinstance(s, tuple)
             for state_ in states:
@@ -152,6 +157,13 @@ class Network(eqx.Module):
         self.classifier = Linear(C_prev, num_classes, key=mrk())
 
         self._initialize_alphas()
+
+    def init_state(self):
+        dtype = self.classifier.weight.dtype
+        device = self.classifier.weight.device()
+        x = jaxm.ones((2, 3, 4, 4), dtype=dtype, device=device)
+        _, state = self.__call__(x)
+        return state
 
     def new(self):
         model_new = Network(self._C, self._num_classes, self._layers, self._criterion).cuda()

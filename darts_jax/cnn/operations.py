@@ -17,8 +17,6 @@ class ReLU(eqx.Module):
     def __call__(self, x, *args, **kw):
         return jaxm.maximum(x, 0)
 
-STATE_INIT_COUNTER = 0
-
 ####################################################################################################
 
 
@@ -42,8 +40,6 @@ class BatchNorm2d(eqx.Module):
     def init_state(self):
         running_mean = jaxm.zeros(self.in_channels)
         running_var = jaxm.ones(self.in_channels)
-        global STATE_INIT_COUNTER
-        STATE_INIT_COUNTER += 1
         return {
             f"{self.hash}_running_mean": running_mean,
             f"{self.hash}_running_var": running_var,

@@ -1,3 +1,29 @@
+# Differentiable Architecture Search in JAX
+
+DARTS code for architecture search model implemented in JAX. Currently, majority of the codebase is not supported. Only `model_search.py` and its dependecies are transcribed. This allows to build a DARTS model `Network` in JAX.
+
+The majority of the port makes use of the excellent [Equinox](https://docs.kidger.site/equinox/) (for JAX) library. 
+
+This pacakge depends on [jfi](https://github.com/rdyro/jfi-JAXFriendlyInterface), a helper interface for JAX I made.
+
+Done:
+- [x] `model_search.py` ported, `Network` can be represented in JAX
+- [x] `make_functional` implemented to convert a DARTS Network in a functional model
+- [x] custom `BatchNorm2d` implemented 
+
+TODO:
+- [ ] port training code
+- [ ] port most likely network resolution (alpha argmax)
+- [ ] ...
+
+---
+
+<p align="center" style="font-size:30pt">
+Original README below
+</p>
+
+---
+
 # Differentiable Architecture Search
 Code accompanying the paper
 > [DARTS: Differentiable Architecture Search](https://arxiv.org/abs/1806.09055)\
