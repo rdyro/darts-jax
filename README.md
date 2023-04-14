@@ -6,6 +6,19 @@ The majority of the port makes use of the excellent [Equinox](https://docs.kidge
 
 This pacakge depends on [jfi](https://github.com/rdyro/jfi-JAXFriendlyInterface), a helper interface for JAX I made.
 
+Equinox provides an experimental BatchNorm, but I found it to slow compilation enormously. Instead, I implemented a custom BatchNorm2d, but with explicit `state` tracking.
+
+```python
+from darts_jax.cnn.model_search import Network
+
+in_channels, classes, layers = 3, 10, 16
+network = Network(in_channels, classes, layers)
+x0 = jaxm.randn((2, 3, 32, 32))
+
+x, state0 = network(x0)
+x, state = network(x0, state=state)
+```
+
 Done:
 - [x] `model_search.py` ported, `Network` can be represented in JAX
 - [x] `make_functional` implemented to convert a DARTS Network in a functional model
