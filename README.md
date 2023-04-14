@@ -9,6 +9,7 @@ This pacakge depends on [jfi](https://github.com/rdyro/jfi-JAXFriendlyInterface)
 Equinox provides an experimental BatchNorm, but I found it to slow compilation enormously. Instead, I implemented a custom BatchNorm2d, but with explicit `state` tracking.
 
 ```python
+from jfi import jaxm # JAXFriendlyInterface module
 from darts_jax.cnn.model_search import Network
 
 in_channels, classes, layers = 3, 10, 16
