@@ -1,5 +1,6 @@
 import time
-from typing import List, Callable, Optional, Union
+from typing import List, Callable, Optional, Union, Dict
+import re
 from copy import copy
 
 # import torch
@@ -9,31 +10,41 @@ from .genotypes import PRIMITIVES
 from .genotypes import Genotype
 
 import numpy as np
+from jfi import jaxm, make_random_key
 
-from jfi import jaxm, make_random_key as mrk
-import equinox as eqx
-from equinox import nn
+import haiku as hk
 
 Array = jaxm.jax.Array
 
 
-class MixedOp(eqx.Module):
-    _ops: List[eqx.Module]
-
-    def __init__(self, C, stride):
+class MixedOp(hk.Module):
+    def __init__(self, C, stride, device=None, name=None):
+        assert name is not None
+        super().__init__(name=name)
         self._ops = []
-        for primitive in PRIMITIVES:
-            op = OPS[primitive](C, stride, False)
+        for i, primitive in enumerate(PRIMITIVES):
+            op = OPS[primitive](C, stride, False, device=device, name=f"{self.name}__op_{i}")
             if "pool" in primitive:
-                op = Sequential([op, BatchNorm2d(C, affine=False)])
+                op = Sequential(
+                    [
+                        op,
+                        BatchNorm2d(
+                            C, affine=False, device=device, name=f"{self.name}__op_{i}__bn"
+                        ),
+                    ]
+                )
             self._ops.append(op)
 
     def __call__(self, x, state=None, weights=None):
         # return sum(w * op(x) for w, op in zip(weights, self._ops))
         assert weights is not None
-        outputs = [op(x, state=state) for op in self._ops]
+        # outputs = [op(x, state=state) for op in self._ops]
+        outputs = []
+        for op in self._ops:
+            # print(f"op = {op}")
+            outputs.append(op(x, state=state))
         xs, states = zip(
-            *[(out[0], out[1]) if isinstance(out, tuple) else (out[0], dict()) for out in outputs]
+            *[(out[0], out[1]) if isinstance(out, tuple) else (out, dict()) for out in outputs]
         )
         x = sum(w * x for w, x in zip(weights, xs))
         state = dict()
@@ -42,25 +53,41 @@ class MixedOp(eqx.Module):
         return x, state
 
 
-class Cell(eqx.Module):
-    preprocess0: Union[ReLUConvBN, FactorizedReduce]
-    preprocess1: ReLUConvBN
-    _steps: int
-    _multiplier: int
-    _ops: List[eqx.Module]
-    reduction: bool
-    C: int
-    C_prev: int
-    C_prev_prev: int
-
-    def __init__(self, steps, multiplier, C_prev_prev, C_prev, C, reduction, reduction_prev):
+class Cell(hk.Module):
+    def __init__(
+        self,
+        steps,
+        multiplier,
+        C_prev_prev,
+        C_prev,
+        C,
+        reduction,
+        reduction_prev,
+        device=None,
+        name=None,
+    ):
+        assert name is not None
+        super().__init__(name=name)
         self.reduction = reduction
 
         if reduction_prev:
-            self.preprocess0 = FactorizedReduce(C_prev_prev, C, affine=False)
+            self.preprocess0 = FactorizedReduce(
+                C_prev_prev, C, affine=False, device=device, name=f"{self.name}__preprocess0"
+            )
         else:
-            self.preprocess0 = ReLUConvBN(C_prev_prev, C, 1, 1, 0, affine=False)
-        self.preprocess1 = ReLUConvBN(C_prev, C, 1, 1, 0, affine=False)
+            self.preprocess0 = ReLUConvBN(
+                C_prev_prev,
+                C,
+                1,
+                1,
+                0,
+                affine=False,
+                device=device,
+                name=f"{self.name}__preprocess0",
+            )
+        self.preprocess1 = ReLUConvBN(
+            C_prev, C, 1, 1, 0, affine=False, device=device, name=f"{self.name}__preprocess1"
+        )
         self._steps = steps
         self._multiplier = multiplier
         self.C = C
@@ -71,13 +98,16 @@ class Cell(eqx.Module):
         for i in range(self._steps):
             for j in range(2 + i):
                 stride = 2 if reduction and j < 2 else 1
-                op = MixedOp(C, stride)
+                op = MixedOp(C, stride, device=device, name=f"{self.name}__op_{i}_{j}")
                 self._ops.append(op)
 
     def __call__(self, s0, s1, weights, state=None):
         state = dict() if state is None else copy(state)
+        # print(f"cell: {s0.shape}, {s1.shape}")
         s0, state = self.preprocess0(s0, state=state)
         s1, state = self.preprocess1(s1, state=state)
+        # print(f"{self.preprocess1}")
+        # print(f"succ: {s0.shape}, {s1.shape}")
 
         outputs = [s0, s1]
         offset = 0
@@ -90,6 +120,7 @@ class Cell(eqx.Module):
             ss, states = zip(
                 *[(ret[0], ret[1]) if isinstance(ret, tuple) else (ret[0], dict()) for ret in rets]
             )
+            # print(f"self._ops = {self._ops[:len(outputs)]}")
             s = sum(ss)
             assert not isinstance(s, tuple)
             for state_ in states:
@@ -99,46 +130,43 @@ class Cell(eqx.Module):
 
         x = jaxm.cat(outputs[-self._multiplier :], axis=-3)
         assert x.shape[-3] == self.C * self._multiplier
+        # print(f"x.shape = {x.shape}")
         return x, state
 
 
-class Network(eqx.Module):
-    _C: int
-    _num_classes: int
-    _layers: int
-    _criterion: Callable
-    _steps: int
-    _multiplier: int
-    cells: List[eqx.Module]
-    alphas_normal: Array
-    alphas_reduce: Array
-    _arch_parameters: List[Array]
-    stem: Sequential
-    global_pooling: AdaptiveAvgPool2d
-    classifier: Linear
-
+class Network(hk.Module):
     def __init__(
         self,
         C,
         num_classes,
         layers,
-        criterion: Optional[Callable] = None,
         steps=4,
         multiplier=4,
         stem_multiplier=3,
+        device=None,
+        name=None,
     ):
+        super().__init__(name=name)
         self._C = C
         self._num_classes = num_classes
         self._layers = layers
-        self._criterion = criterion
         self._steps = steps
         self._multiplier = multiplier
 
         C_curr = stem_multiplier * C
         self.stem = Sequential(
-            [Conv2d(3, C_curr, 3, padding=1, use_bias=False, key=mrk()), BatchNorm2d(C_curr)]
+            [
+                Conv2D(
+                    C_curr,
+                    3,
+                    padding=(1, 1),
+                    with_bias=False,
+                    device=device,
+                    name=f"{self.name}__stem__conv",
+                ),
+                BatchNorm2d(C_curr, device=device, name=f"{self.name}__stem__bn"),
+            ],
         )
-
         C_prev_prev, C_prev, C_curr = C_curr, C_curr, C
         self.cells = []
         reduction_prev = False
@@ -148,15 +176,27 @@ class Network(eqx.Module):
                 reduction = True
             else:
                 reduction = False
-            cell = Cell(steps, multiplier, C_prev_prev, C_prev, C_curr, reduction, reduction_prev)
+            cell = Cell(
+                steps,
+                multiplier,
+                C_prev_prev,
+                C_prev,
+                C_curr,
+                reduction,
+                reduction_prev,
+                device=device,
+                name=f"{self.name}__cell{i}",
+            )
             reduction_prev = reduction
             self.cells += [cell]
             C_prev_prev, C_prev = C_prev, multiplier * C_curr
 
-        self.global_pooling = AdaptiveAvgPool2d(1)
-        self.classifier = Linear(C_prev, num_classes, key=mrk())
+        self.global_pooling = AdaptiveAvgPool2d(
+            1, device=device, name=f"{self.name}__global_pooling"
+        )
+        self.classifier = Linear(num_classes, device=device, name=f"{self.name}__classifier")
 
-        self._initialize_alphas()
+        self._initialize_alphas(device)
 
     def init_state(self):
         dtype = self.classifier.weight.dtype
@@ -164,12 +204,6 @@ class Network(eqx.Module):
         x = jaxm.ones((2, 3, 4, 4), dtype=dtype, device=device)
         _, state = self.__call__(x)
         return state
-
-    def new(self):
-        model_new = Network(self._C, self._num_classes, self._layers, self._criterion).cuda()
-        for x, y in zip(model_new.arch_parameters(), self.arch_parameters()):
-            x.data.copy_(y.data)
-        return model_new
 
     def __call__(self, input, state=None):
         state = dict() if state is None else copy(state)
@@ -185,18 +219,17 @@ class Network(eqx.Module):
         logits = self.classifier(out.reshape(out.shape[:-3] + (-1,)), state=state)
         return logits, state
 
-    def _loss(self, input, target):
-        logits = self(input)
-        return self._criterion(logits, target)
-
-    def _initialize_alphas(self):
+    def _initialize_alphas(self, device=None):
         k = sum(1 for i in range(self._steps) for n in range(2 + i))
         num_ops = len(PRIMITIVES)
 
-        # self.alphas_normal = Variable(1e-3*torch.randn(k, num_ops).cuda(), requires_grad=True)
-        # self.alphas_reduce = Variable(1e-3*torch.randn(k, num_ops).cuda(), requires_grad=True)
-        self.alphas_normal = 1e-3 * jaxm.randn((k, num_ops))
-        self.alphas_reduce = 1e-3 * jaxm.randn((k, num_ops))
+        def random_init(shape, dtype):
+            return 1e-3 * jaxm.randn(shape, dtype=dtype, device=device)
+
+        self.alphas_normal = hk.get_parameter("alphas_normal", (k, num_ops), init=random_init)
+        self.alphas_reduce = hk.get_parameter("alphas_reduce", (k, num_ops), init=random_init)
+        # self.alphas_normal = 1e-3 * jaxm.randn((k, num_ops), device=device)
+        # self.alphas_reduce = 1e-3 * jaxm.randn((k, num_ops), device=device)
         self._arch_parameters = [self.alphas_normal, self.alphas_reduce]
 
     def arch_parameters(self):
@@ -235,3 +268,82 @@ class Network(eqx.Module):
             normal=gene_normal, normal_concat=concat, reduce=gene_reduce, reduce_concat=concat
         )
         return genotype
+
+
+####################################################################################################
+
+
+def make_haiku_network(
+    C, num_classes, layers, steps=4, multiplier=4, stem_multiplier=3, device=None
+):
+    example_input = jaxm.randn((2, C, 32, 32), device=device)
+
+    def _fwd(x):
+        net = Network(C, num_classes, layers, steps, multiplier, stem_multiplier, device=device)
+        return net(x)
+
+    net = hk.transform(_fwd)
+    net_params = net.init(make_random_key(), example_input)
+    _, state = net.apply(net_params, make_random_key(), example_input)
+
+    flat_param_dict = flatten_dict(net_params)
+    z_params = {k: v for k, v in flat_param_dict.items() if re.search("alphas_", k) is None}
+    p_params = {k: v for k, v in flat_param_dict.items() if re.search("alphas_", k) is not None}
+    z_shapes = {k: v.shape for k, v in z_params.items()}
+    p_shapes = {k: v.shape for k, v in p_params.items()}
+    z_sizes = [v.size for v in z_params.values()]
+    p_sizes = [v.size for v in p_params.values()]
+    z_splits = np.cumsum(z_sizes)[:-1].tolist()
+    p_splits = np.cumsum(p_sizes)[:-1].tolist()
+
+    def params2zp(params: Dict):
+        flat_params = flatten_dict(params)
+        z = jaxm.cat(
+            [v.reshape(-1) for k, v in flat_params.items() if re.search("alphas_", k) is None]
+        )
+        p = jaxm.cat(
+            [v.reshape(-1) for k, v in flat_params.items() if re.search("alphas_", k) is not None]
+        )
+        return z, p
+
+    def zp2params(z: Array, p: Array):
+        ps = jaxm.split(p, p_splits)
+        zs = jaxm.split(z, z_splits)
+        z_dict = {k: v.reshape(s) for (k, s), v in zip(z_shapes.items(), zs)}
+        p_dict = {k: v.reshape(s) for (k, s), v in zip(p_shapes.items(), ps)}
+        params = z_dict
+        params.update(p_dict)
+        params = unflatten_dict(params)
+        return params
+
+    random_key = make_random_key()
+
+    def fwd_fn(z, p, x, state):
+        params = zp2params(z, p)
+        y, state = net.apply(params, random_key, (x, state))
+        return y, state
+
+    return fwd_fn, net, net_params, state, params2zp, zp2params
+
+
+def flatten_dict(d: Dict, separator: str = ":") -> Dict:
+    flat_d = dict()
+    for k, v in d.items():
+        if isinstance(v, dict):
+            flat_d.update({f"{k}{separator}{k2}": v2 for k2, v2 in flatten_dict(v).items()})
+        else:
+            flat_d[k] = v
+    return flat_d
+
+
+def unflatten_dict(flat_d: Dict, separator: str = ":") -> Dict:
+    d = dict()
+    for k, v in flat_d.items():
+        if separator in k:
+            k1, k2 = k.split(separator, maxsplit=1)
+            if k1 not in d:
+                d[k1] = dict()
+            d[k1].update(unflatten_dict({k2: v}))
+        else:
+            d[k] = v
+    return d
