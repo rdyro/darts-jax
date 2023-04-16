@@ -19,7 +19,6 @@ Array = jaxm.jax.Array
 
 class MixedOp(hk.Module):
     def __init__(self, C, stride, device=None, name=None):
-        assert name is not None
         super().__init__(name=name)
         self._ops = []
         for i, primitive in enumerate(PRIMITIVES):

@@ -27,48 +27,13 @@ class ReLU(hk.Module):
 
 
 class BatchNorm2d(hk.Module):
-    def __init__(self, in_channels, affine=False, momentum=0.1, eps=1e-5, device=None, name=None):
-        assert name is not None
-        super().__init__(name=name)
-        self.device = device
-        self.in_channels = in_channels
-        self.momentum = momentum
-        self.affine = affine
-        self.gamma, self.beta = jaxm.ones(1, device=self.device), jaxm.zeros(1, device=self.device)
-        self.hash = self.name
-        self.eps = eps
+    def __init__(self, in_channels, affine=False):
+        self.op = hk.BatchNorm(
+            create_offset=affine, create_scale=affine, axis=-3, data_format="NCHW"
+        )
 
-    def init_state(self):
-        running_mean = jaxm.zeros(self.in_channels, device=self.device)
-        running_var = jaxm.ones(self.in_channels, device=self.device)
-        return {
-            f"{self.hash}_running_mean": running_mean,
-            f"{self.hash}_running_var": running_var,
-        }
-
-    def __call__(self, x, state=None):
-        x, state = x if isinstance(x, tuple) else (x, state)
-        if state is None:
-            state = self.init_state()
-        if f"{self.hash}_running_mean" not in state or f"{self.hash}_running_var" not in state:
-            state = dict(state, **self.init_state())
-        running_mean = state[f"{self.hash}_running_mean"]
-        running_var = state[f"{self.hash}_running_var"]
-
-        axis = tuple(-i for i in range(1, x.ndim + 1) if i != -3)
-        mean = jaxm.mean(x, axis=axis)
-        var = jaxm.var(x, axis=axis)
-        running_mean = (1 - self.momentum) * running_mean + self.momentum * mean
-        running_var = (1 - self.momentum) * running_var + self.momentum * var
-        state[f"{self.hash}_running_mean"] = running_mean
-        state[f"{self.hash}_running_var"] = running_var
-
-        mean, var = running_mean[:, None, None], running_var[:, None, None]
-        if self.affine:
-            x = (x - mean) / jaxm.sqrt(var + self.eps) * self.gamma + self.beta
-        else:
-            x = (x - mean) / jaxm.sqrt(var + self.eps)
-        return x, state
+    def __call__(self, x):
+        return self.op(x)
 
 
 ####################################################################################################
@@ -343,10 +308,22 @@ class FactorizedReduce(hk.Module):
         assert C_out % 2 == 0
         self.relu = ReLU(name=f"{self.name}__relu")
         self.conv_1 = Conv2D(
-            C_out // 2, 1, stride=2, padding=(0, 0), with_bias=False, device=device, name=f"{self.name}__conv1"
+            C_out // 2,
+            1,
+            stride=2,
+            padding=(0, 0),
+            with_bias=False,
+            device=device,
+            name=f"{self.name}__conv1",
         )
         self.conv_2 = Conv2D(
-            C_out // 2, 1, stride=2, padding=(0, 0), with_bias=False, device=device, name=f"{self.name}__conv2"
+            C_out // 2,
+            1,
+            stride=2,
+            padding=(0, 0),
+            with_bias=False,
+            device=device,
+            name=f"{self.name}__conv2",
         )
         self.bn = BatchNorm2d(C_out, affine=affine, device=device, name=f"{self.name}__bn")
 
