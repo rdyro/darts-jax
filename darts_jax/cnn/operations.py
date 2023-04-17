@@ -1,16 +1,82 @@
-import time
 from typing import List, Callable, Optional, Union
+from functools import partial
 from copy import copy
 
-# import torch
-
-from jfi import jaxm, make_random_key as mrk
-
+from jfi import jaxm
 import haiku as hk
-
 from jax import Array, lax
 
-batch_wrapper = lambda x: jaxm.vmap(x)
+
+# class BatchNorm2d(hk.Module):
+#    def __init__(self, in_channels, affine=False, name=None):
+#        super().__init__(name=name)
+#        axis = tuple(-i for i in range(1, 4 + 1) if -i != -3)
+#        self.op = hk.BatchNorm(
+#            create_offset=affine, create_scale=affine, decay_rate=0.1, axis=axis, data_format="NCHW"
+#        )
+#        self.training = hk.get_state("training", (), bool, init=jaxm.ones)
+#        # hk.set_state("training", jaxm.ones((), dtype=bool))
+#
+#        #@partial(jaxm.jit, static_argnums=1)
+#        #def call(x, training):
+#        #    return self.op(x, is_training=training)
+#
+#        #self.call = call
+#
+#    def __call__(self, x):
+#        training = hk.get_state("training")
+#        try:
+#            return hk.cond(training, lambda: self.op(x, is_training=True), lambda: self.op(x, is_training=False))
+#        except ValueError:
+#            return self.op(x, is_training=True)
+#        #return self.call(x, training)
+#        #return hk.cond(training, lambda: self.op(x, True), lambda: self.op(x, False))
+
+
+class BatchNorm2d(hk.Module):
+    def __init__(self, in_channels, affine=False, momentum=0.1, eps=1e-5, name=None):
+        super().__init__(name=name)
+        self.in_channels = in_channels
+        self.momentum = momentum
+        self.affine = affine
+        self.gamma = hk.get_parameter("gamma", (), init=jaxm.numpy.ones)
+        self.beta = hk.get_parameter("beta", (), init=jaxm.numpy.zeros)
+        self.eps = eps
+        self.running_mean = hk.get_state(
+            "running_mean", (in_channels,), jaxm.float32, init=jaxm.numpy.zeros
+        )
+        self.running_var = hk.get_state(
+            "running_var", (in_channels,), jaxm.float32, init=jaxm.numpy.ones
+        )
+        self.training = hk.get_state("training", (), jaxm.float32, init=jaxm.numpy.ones)
+
+    def __call__(self, x):
+        running_mean = hk.get_state("running_mean")
+        running_var = hk.get_state("running_var")
+        training = hk.get_state("training")
+
+        axis = tuple(-i for i in range(1, x.ndim + 1) if i != -3)
+        mean = jaxm.mean(x, axis=axis)
+        var = jaxm.var(x, axis=axis)
+
+        momentum = training * self.momentum
+        running_mean = (1 - momentum) * running_mean + momentum * mean
+        running_var = (1 - momentum) * running_var + momentum * var
+
+        hk.set_state("running_mean", running_mean)
+        hk.set_state("running_var", running_var)
+
+        gamma = hk.get_parameter("gamma", (), init=jaxm.numpy.ones)
+        beta = hk.get_parameter("beta", (), init=jaxm.numpy.zeros)
+        mean, var = running_mean[:, None, None], running_var[:, None, None]
+        if self.affine:
+            x = (x - mean) / jaxm.sqrt(var + self.eps) * gamma + beta
+        else:
+            x = (x - mean) / jaxm.sqrt(var + self.eps)
+        return x
+
+
+####################################################################################################
 
 
 class ReLU(hk.Module):
@@ -18,60 +84,17 @@ class ReLU(hk.Module):
         assert name is not None
         super().__init__(name=name)
 
-    def __call__(self, x, *args, state=None, **kw):
-        (x, state) = x if isinstance(x, tuple) else (x, state)
-        return jaxm.maximum(x, 0)
-
-
-####################################################################################################
-
-
-class BatchNorm2d(hk.Module):
-    def __init__(self, in_channels, affine=False):
-        self.op = hk.BatchNorm(
-            create_offset=affine, create_scale=affine, axis=-3, data_format="NCHW"
-        )
-
     def __call__(self, x):
-        return self.op(x)
-
-
-####################################################################################################
-
-
-class Sequential(hk.Module):
-    def __init__(self, mod_list: List[hk.Module], device=None, name=None):
-        super().__init__(name=name)
-        self.mod_list = mod_list
-
-    def init_state(self):
-        state = dict()
-        for mod in self.mod_list:
-            if hasattr(mod, "init_state"):
-                state = dict(state, **mod.init_state())
-        return state
-
-    def __call__(self, x, state=None):
-        x, state = x if isinstance(x, tuple) else (x, state)
-        total_state = dict() if state is None else copy(state)
-        for mod in self.mod_list:
-            out = mod(x, state=total_state)
-            if isinstance(out, tuple):
-                x, state = out
-                total_state = dict(total_state, **state)
-            else:
-                x = out
-        return x, total_state
+        return jaxm.maximum(x, 0)
 
 
 class AdaptiveAvgPool2d(hk.Module):
     def __init__(self, size: int, device=None, name=None):
         assert name is not None
         super().__init__(name=name)
-        assert size == 1
+        assert size == 1 or size == (1, 1)
 
-    def __call__(self, x, state=None):
-        x, state = x if isinstance(x, tuple) else (x, state)
+    def __call__(self, x):
         return jaxm.mean(x, axis=(-1, -2), keepdims=True)
 
 
@@ -83,19 +106,17 @@ class Conv2D(hk.Module):
             del kw["device"]
         self.op = hk.Conv2D(*args, **kw, data_format="NCHW")
 
-    def __call__(self, x, state=None):
-        x, state = x if isinstance(x, tuple) else (x, state)
+    def __call__(self, x):
         return self.op(x)
 
 
 class Linear(hk.Module):
-    def __init__(self, output_size, device=None, name=None):
+    def __init__(self, output_size, name=None):
         assert name is not None
         super().__init__(name=name)
         self.op = hk.Linear(output_size)
 
-    def __call__(self, x, state=None):
-        x, state = x if isinstance(x, tuple) else (x, state)
+    def __call__(self, x):
         return self.op(x)
 
 
@@ -109,9 +130,38 @@ class MaxPool2d(hk.Module):
             del kw["device"]
         self.op = hk.MaxPool(*args, **kw, channel_axis=-3)
 
-    def __call__(self, x, state=None):
-        x, state = x if isinstance(x, tuple) else (x, state)
+    def __call__(self, x):
         return self.op(x)
+
+
+# class AvgPool2d(hk.Module):
+#    def __init__(self, *args, name=None, **kw):
+#        assert name is not None
+#        super().__init__(name=name)
+#        self.device = kw.get("device")
+#        if "stride" in kw:
+#            kw["strides"] = kw.pop("stride")
+#        # self.op = hk.AvgPool(*args, **kw, channel_axis=-3)
+#        kernel_shape = kw.get("kernel_shape", args[0])
+#        self.kernel_shape = (
+#            (kernel_shape, kernel_shape) if isinstance(kernel_shape, int) else kernel_shape
+#        )
+#        stride = kw.get("strides")
+#        if stride is None:
+#            stride = args[1]
+#        self.stride = (stride, stride) if isinstance(stride, int) else stride
+#        padding = kw.get("padding")
+#        if padding is None:
+#            padding = args[2]
+#        self.padding = padding
+#        self.kernel = jaxm.ones(self.kernel_shape, device=self.device) / (
+#            self.kernel_shape[0] * self.kernel_shape[1]
+#        )
+#
+#    def __call__(self, x):
+#        kernel = jaxm.tile(self.kernel, (x.shape[-3], x.shape[-3], 1, 1))
+#        kernel = jaxm.to(kernel, dtype=x.dtype, device=self.device)
+#        return lax.conv(x, kernel, self.stride, self.padding)
 
 
 class AvgPool2d(hk.Module):
@@ -121,7 +171,6 @@ class AvgPool2d(hk.Module):
         self.device = kw.get("device")
         if "stride" in kw:
             kw["strides"] = kw.pop("stride")
-        # self.op = hk.AvgPool(*args, **kw, channel_axis=-3)
         kernel_shape = kw.get("kernel_shape", args[0])
         self.kernel_shape = (
             (kernel_shape, kernel_shape) if isinstance(kernel_shape, int) else kernel_shape
@@ -134,16 +183,9 @@ class AvgPool2d(hk.Module):
         if padding is None:
             padding = args[2]
         self.padding = padding
-        self.kernel = jaxm.ones(self.kernel_shape, device=self.device) / (
-            self.kernel_shape[0] * self.kernel_shape[1]
-        )
 
-    def __call__(self, x, state=None):
-        x, state = x if isinstance(x, tuple) else (x, state)
-        # return x
-        kernel = jaxm.tile(self.kernel, (x.shape[-3], x.shape[-3], 1, 1))
-        kernel = jaxm.to(kernel, dtype=x.dtype, device=self.device)
-        return lax.conv(x, kernel, self.stride, self.padding)
+    def __call__(self, x):
+        return hk.avg_pool(x, self.kernel_shape, self.stride, self.padding, channel_axis=-3)
 
 
 ####################################################################################################
@@ -156,7 +198,7 @@ class ReLUConvBN(hk.Module):
         assert name is not None
         super().__init__(name=name)
         padding = (padding, padding) if isinstance(padding, int) else padding
-        self.op = Sequential(
+        self.op = hk.Sequential(
             [
                 ReLU(name=f"{self.name}__relu"),
                 Conv2D(
@@ -168,7 +210,7 @@ class ReLUConvBN(hk.Module):
                     device=device,
                     name=f"{self.name}__conv",
                 ),
-                BatchNorm2d(C_out, affine=affine, device=device, name=f"{self.name}__bn"),
+                BatchNorm2d(C_out, affine=affine, name=f"{self.name}__bn"),
             ]
         )
 
@@ -192,7 +234,7 @@ class DilConv(hk.Module):
         assert name is not None
         super().__init__(name=name)
         padding = (padding, padding) if isinstance(padding, int) else padding
-        self.op = Sequential(
+        self.op = hk.Sequential(
             [
                 ReLU(name=f"{self.name}__relu"),
                 Conv2D(
@@ -214,7 +256,7 @@ class DilConv(hk.Module):
                     device=device,
                     name=f"{self.name}__conv2",
                 ),
-                BatchNorm2d(C_out, affine=affine, device=device, name=f"{self.name}__bn"),
+                BatchNorm2d(C_out, affine=affine, name=f"{self.name}__bn"),
             ]
         )
 
@@ -229,7 +271,7 @@ class SepConv(hk.Module):
         assert name is not None
         super().__init__(name=name)
         padding = (padding, padding) if isinstance(padding, int) else padding
-        self.op = Sequential(
+        self.op = hk.Sequential(
             [
                 ReLU(name=f"{self.name}__relu1"),
                 Conv2D(
@@ -250,7 +292,7 @@ class SepConv(hk.Module):
                     device=device,
                     name=f"{self.name}__conv2",
                 ),
-                BatchNorm2d(C_in, affine=affine, device=device, name=f"{self.name}__bn1"),
+                BatchNorm2d(C_in, affine=affine, name=f"{self.name}__bn1"),
                 ReLU(name=f"{self.name}__relu2"),
                 Conv2D(
                     C_in,
@@ -270,7 +312,7 @@ class SepConv(hk.Module):
                     device=device,
                     name=f"{self.name}__conv4",
                 ),
-                BatchNorm2d(C_out, affine=affine, device=device, name=f"{self.name}__bn2"),
+                BatchNorm2d(C_out, affine=affine, name=f"{self.name}__bn2"),
             ]
         )
 
@@ -293,8 +335,7 @@ class Zero(hk.Module):
         super().__init__(name=name)
         self.stride = stride
 
-    def __call__(self, x, *args, **kw):
-        (x, state) = x if isinstance(x, tuple) else (x, None)
+    def __call__(self, x):
         stride = self.stride if isinstance(self.stride, int) else self.stride[0]
         if stride == 1:
             return 0 * x
@@ -325,14 +366,13 @@ class FactorizedReduce(hk.Module):
             device=device,
             name=f"{self.name}__conv2",
         )
-        self.bn = BatchNorm2d(C_out, affine=affine, device=device, name=f"{self.name}__bn")
+        self.bn = BatchNorm2d(C_out, affine=affine, name=f"{self.name}__bn")
 
-    def __call__(self, x, state=None):
-        (x, state) = x if isinstance(x, tuple) else (x, state)
+    def __call__(self, x):
         x = self.relu(x)
         out = jaxm.cat([self.conv_1(x), self.conv_2(x[..., :, 1:, 1:])], axis=-3)
-        out, state = self.bn(out, state=state)
-        return out, state
+        out = self.bn(out)
+        return out
 
 
 OPS = {
@@ -380,7 +420,7 @@ OPS = {
         )
     ),
     "conv_7x1_1x7": (
-        lambda C, stride, affine, device=None, name=None: Sequential(
+        lambda C, stride, affine, device=None, name=None: hk.Sequential(
             [
                 ReLU(name=f"{name}__relu1"),
                 Conv2D(
@@ -401,7 +441,7 @@ OPS = {
                     device=device,
                     name=f"{name}__conv2",
                 ),
-                BatchNorm2d(C, affine=affine, device=device, name=f"{name}__bn1"),
+                BatchNorm2d(C, affine=affine, name=f"{name}__bn1"),
             ]
         )
     ),

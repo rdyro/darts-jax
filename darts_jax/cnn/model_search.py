@@ -24,32 +24,20 @@ class MixedOp(hk.Module):
         for i, primitive in enumerate(PRIMITIVES):
             op = OPS[primitive](C, stride, False, device=device, name=f"{self.name}__op_{i}")
             if "pool" in primitive:
-                op = Sequential(
+                op = hk.Sequential(
                     [
                         op,
-                        BatchNorm2d(
-                            C, affine=False, device=device, name=f"{self.name}__op_{i}__bn"
-                        ),
+                        BatchNorm2d(C, affine=False, name=f"{self.name}__op_{i}__bn"),
                     ]
                 )
             self._ops.append(op)
 
-    def __call__(self, x, state=None, weights=None):
+    def __call__(self, x, weights):
         # return sum(w * op(x) for w, op in zip(weights, self._ops))
         assert weights is not None
-        # outputs = [op(x, state=state) for op in self._ops]
-        outputs = []
-        for op in self._ops:
-            # print(f"op = {op}")
-            outputs.append(op(x, state=state))
-        xs, states = zip(
-            *[(out[0], out[1]) if isinstance(out, tuple) else (out, dict()) for out in outputs]
-        )
+        xs = [op(x) for op in self._ops]
         x = sum(w * x for w, x in zip(weights, xs))
-        state = dict()
-        for state_ in states:
-            state.update(state_)
-        return x, state
+        return x
 
 
 class Cell(hk.Module):
@@ -100,37 +88,24 @@ class Cell(hk.Module):
                 op = MixedOp(C, stride, device=device, name=f"{self.name}__op_{i}_{j}")
                 self._ops.append(op)
 
-    def __call__(self, s0, s1, weights, state=None):
-        state = dict() if state is None else copy(state)
-        # print(f"cell: {s0.shape}, {s1.shape}")
-        s0, state = self.preprocess0(s0, state=state)
-        s1, state = self.preprocess1(s1, state=state)
-        # print(f"{self.preprocess1}")
-        # print(f"succ: {s0.shape}, {s1.shape}")
+    def __call__(self, s0, s1, weights):
+        s0 = self.preprocess0(s0)
+        s1 = self.preprocess1(s1)
 
         outputs = [s0, s1]
         offset = 0
         for i in range(self._steps):
-            # ss, states = zip(*[self._ops[offset + j](h, weights=weights[offset + j], state=state) for j, h in enumerate(states)])
-            rets = [
-                self._ops[offset + j](h, weights=weights[offset + j], state=state)
+            ss = [
+                self._ops[offset + j](h, weights=weights[offset + j])
                 for j, h in enumerate(outputs)
             ]
-            ss, states = zip(
-                *[(ret[0], ret[1]) if isinstance(ret, tuple) else (ret[0], dict()) for ret in rets]
-            )
-            # print(f"self._ops = {self._ops[:len(outputs)]}")
             s = sum(ss)
-            assert not isinstance(s, tuple)
-            for state_ in states:
-                state.update(state_)
             offset += len(outputs)
             outputs.append(s)
 
         x = jaxm.cat(outputs[-self._multiplier :], axis=-3)
         assert x.shape[-3] == self.C * self._multiplier
-        # print(f"x.shape = {x.shape}")
-        return x, state
+        return x
 
 
 class Network(hk.Module):
@@ -153,7 +128,7 @@ class Network(hk.Module):
         self._multiplier = multiplier
 
         C_curr = stem_multiplier * C
-        self.stem = Sequential(
+        self.stem = hk.Sequential(
             [
                 Conv2D(
                     C_curr,
@@ -163,7 +138,7 @@ class Network(hk.Module):
                     device=device,
                     name=f"{self.name}__stem__conv",
                 ),
-                BatchNorm2d(C_curr, device=device, name=f"{self.name}__stem__bn"),
+                BatchNorm2d(C_curr, name=f"{self.name}__stem__bn"),
             ],
         )
         C_prev_prev, C_prev, C_curr = C_curr, C_curr, C
@@ -193,30 +168,22 @@ class Network(hk.Module):
         self.global_pooling = AdaptiveAvgPool2d(
             1, device=device, name=f"{self.name}__global_pooling"
         )
-        self.classifier = Linear(num_classes, device=device, name=f"{self.name}__classifier")
+        self.classifier = Linear(num_classes, name=f"{self.name}__classifier")
 
         self._initialize_alphas(device)
 
-    def init_state(self):
-        dtype = self.classifier.weight.dtype
-        device = self.classifier.weight.device()
-        x = jaxm.ones((2, 3, 4, 4), dtype=dtype, device=device)
-        _, state = self.__call__(x)
-        return state
-
-    def __call__(self, input, state=None):
-        state = dict() if state is None else copy(state)
-        s0, state = self.stem(input, state=state)
+    def __call__(self, input):
+        s0 = self.stem(input)
         s1 = s0
         for i, cell in enumerate(self.cells):
             if cell.reduction:
                 weights = jaxm.softmax(self.alphas_reduce, axis=-1)
             else:
                 weights = jaxm.softmax(self.alphas_normal, axis=-1)
-            (s0, (s1, state)) = s1, cell(s0, s1, weights, state=state)
-        out = self.global_pooling(s1, state=state)
-        logits = self.classifier(out.reshape(out.shape[:-3] + (-1,)), state=state)
-        return logits, state
+            (s0, s1) = s1, cell(s0, s1, weights)
+        out = self.global_pooling(s1)
+        logits = self.classifier(out.reshape(out.shape[:-3] + (-1,)))
+        return logits
 
     def _initialize_alphas(self, device=None):
         k = sum(1 for i in range(self._steps) for n in range(2 + i))
@@ -281,9 +248,9 @@ def make_haiku_network(
         net = Network(C, num_classes, layers, steps, multiplier, stem_multiplier, device=device)
         return net(x)
 
-    net = hk.transform(_fwd)
-    net_params = net.init(make_random_key(), example_input)
-    _, state = net.apply(net_params, make_random_key(), example_input)
+    net = hk.transform_with_state(_fwd)
+    net_params, state = net.init(make_random_key(), example_input)
+    _, state = net.apply(net_params, state, make_random_key(), example_input)
 
     flat_param_dict = flatten_dict(net_params)
     z_params = {k: v for k, v in flat_param_dict.items() if re.search("alphas_", k) is None}
@@ -319,7 +286,7 @@ def make_haiku_network(
 
     def fwd_fn(z, p, x, state):
         params = zp2params(z, p)
-        y, state = net.apply(params, random_key, (x, state))
+        y, state = net.apply(params, state, random_key, x)
         return y, state
 
     return fwd_fn, net, net_params, state, params2zp, zp2params
